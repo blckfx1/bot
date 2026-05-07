@@ -1,0 +1,353 @@
+TECHNICAL INSTRUCTION FOR IMPLEMENTATION
+Multi-Source News Aggregator Telegram Bot
+===========================================
+
+This document provides a complete, step‑by‑step technical guide for an AI agent to implement the system described below. Follow each section in order. All code, configuration, and commands are written for Python 3.10+.
+
+1. PROJECT OVERVIEW & OBJECTIVES
+---------------------------------
+Purpose: Aggregate news/content from Telegram, VKontakte, YouTube across 11 themes (chemistry, music, rap, history, news, programming, vlog, games, DIY, technica, travel). Target platform: Telegram bot as user interface. Key goals: automated fetching, filtering by theme, periodic updates, user subscription management.
+
+2. FUNCTIONAL REQUIREMENTS
+---------------------------
+Bot commands:
+  /start          – welcome message, show available themes
+  /subscribe      – interactive theme selection via inline keyboard
+  /unsubscribe    – list user’s subscriptions to remove
+  /list           – show current subscriptions for the user
+  /help           – usage instructions
+
+Multi‑source ingestion:
+  - Telegram channels (public) – via Telethon (MTProto)
+  - VK public pages / groups – via VK API (wall.get)
+  - YouTube channels / playlists – via YouTube Data API v3
+
+Theme classification: rule‑based using keywords, hashtags, and channel‑category overrides.
+
+3. NON‑FUNCTIONAL REQUIREMENTS
+-------------------------------
+- Response time for user queries <2 seconds.
+- Periodic updates: news/programming every 1h, music/rap/vlog every 3h, others every 6h; maximum delay 15 min.
+- Scalability: support up to 10k users, 50 sources per theme.
+- Error handling: respect API rate limits, exponential backoff retry.
+
+4. DATA SOURCES & API SPECIFICATIONS
+-------------------------------------
+Telegram:
+  - Use Telethon library (MTProto) with api_id, api_hash. For public channels, no user login required if using bot token? Telethon requires a user account. Alternative: scrape public channels via tg‑scraper library. We will use Telethon with a dedicated user account (set up as environment variable).
+VKontakte:
+  - VK API v5.131: method wall.get (owner_id, domain). Access via access_token (community or service token).
+YouTube:
+  - YouTube Data API v3: channels → videos endpoint. API key required.
+Rate limits: VK – 3 requests per second; YouTube – 10k units per day; Telegram – no strict limit but avoid flooding.
+
+5. DATA MODEL & STORAGE SCHEMA
+-------------------------------
+Use PostgreSQL (>=13) with SQLAlchemy ORM. Redis optional for caching (not mandatory for first version).
+
+Tables:
+
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    tg_id BIGINT UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE themes (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(50) UNIQUE NOT NULL  -- chemistry, music, rap, history, news, programming, vlog, games, diy, technica, travel
+);
+
+CREATE TABLE sources (
+    id SERIAL PRIMARY KEY,
+    platform VARCHAR(20) NOT NULL,  -- telegram, vk, youtube
+    external_id VARCHAR(255) NOT NULL, -- channel username, vk group id, youtube channel id
+    title VARCHAR(255),
+    theme_override INTEGER NULL REFERENCES themes(id), -- optional manual theme
+    last_fetched TIMESTAMP DEFAULT '1970-01-01',
+    UNIQUE(platform, external_id)
+);
+
+CREATE TABLE posts (
+    id SERIAL PRIMARY KEY,
+    source_id INTEGER REFERENCES sources(id) ON DELETE CASCADE,
+    external_id VARCHAR(255) NOT NULL,
+    title TEXT,
+    text TEXT,
+    media_urls TEXT[],  -- array of URLs
+    publish_time TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(source_id, external_id)
+);
+
+CREATE TABLE post_themes (
+    post_id INTEGER REFERENCES posts(id),
+    theme_id INTEGER REFERENCES themes(id),
+    PRIMARY KEY(post_id, theme_id)
+);
+
+CREATE TABLE user_subscriptions (
+    user_id INTEGER REFERENCES users(id),
+    source_id INTEGER REFERENCES sources(id),
+    PRIMARY KEY(user_id, source_id)
+);
+
+Indexes:
+  CREATE INDEX idx_posts_publish_time ON posts(publish_time);
+  CREATE INDEX idx_posts_theme ON post_themes(theme_id);
+  CREATE INDEX idx_user_subs_user ON user_subscriptions(user_id);
+
+6. SYSTEM ARCHITECTURE (TEXT DESCRIPTION)
+------------------------------------------
+Components:
+  - Telegram Bot (async handler): processes commands, sends notifications.
+  - Fetcher Scheduler (APScheduler): triggers fetch jobs per source type.
+  - Classifier Engine: assigns themes to posts based on keywords/overrides.
+  - Database (PostgreSQL): stores all persistent data.
+  - API Gateway layer: each adapter handles its own API calls.
+
+Data flow:
+  Scheduler -> for each source: Adapter.fetch() -> raw post -> Classifier -> store post -> get subscribed users -> Bot.send_message()
+
+7. BOT INTERFACE & COMMAND DESIGN
+----------------------------------
+Use python‑telegram‑bot v20+ with async.
+
+Command handlers structure:
+  - /start: send message with inline keyboard showing all themes.
+  - /subscribe: after theme selection, query sources with that theme (or no override). Show inline keyboards for sources. On confirmation, insert into user_subscriptions.
+  - /unsubscribe: query user_subscriptions join sources, show inline buttons "Unsubscribe [source title]".
+  - /list: simple text list of subscribed sources.
+  - /help: brief instructions.
+
+Notification format: When a new post is stored, check all users subscribed to that source. Send message:
+  *Title*: <title>
+  *Text preview*: first 300 chars
+  *Link*: (construct platform‑specific URL)
+  *Themes*: comma separated
+  Attach first media URL if exists (photo/video).
+
+Implement inline keyboard for pagination if many sources.
+
+8. CONTENT FETCHING MODULE
+---------------------------
+Create a module `fetchers/` with three adapter classes implementing the same interface:
+
+class BaseAdapter(ABC):
+    def __init__(self, api_config: dict):
+        self.config = api_config
+
+    @abstractmethod
+    async def fetch(self, source: Source, since: datetime) -> List[RawPost]:
+        pass
+
+RawPost = namedtuple('RawPost', ['external_id', 'title', 'text', 'media_urls', 'publish_time'])
+
+TelegramAdapter uses Telethon:
+  - Connect to client (global client instance reused).
+  - For a channel entity (username), get messages after `since` using `client.get_messages(entity, offset_date=since)`.
+  - Map each message: external_id = message.id, title = None, text = message.text or message.caption, media_urls = download media links (or None), publish_time = message.date.
+
+VKAdapter uses aiohttp + VK API:
+  - Endpoint: wall.get (owner_id = -group_id for groups, positive for user). Use domain if available.
+  - Since: convert to Unix timestamp, use `start_time` parameter.
+  - Parse items: external_id = item['id'], title = None, text = item['text'], media_urls = extract photo URLs from attachments, publish_time = datetime.fromtimestamp(item['date']).
+
+YouTubeAdapter uses aiohttp + YouTube Data API v3:
+  - For a channel: get uploads playlist id from channels.list(part=contentDetails, id=channel_id).
+  - Then playlistItems.list(part=snippet, playlistId=uploads, publishedAfter=since.isoformat()).
+  - Each item: external_id = item['snippet']['resourceId']['videoId'], title = item['snippet']['title'], text = item['snippet']['description'], media_urls = [thumbnail URL], publish_time = item['snippet']['publishedAt'].
+
+All adapters must handle rate limits: on 429 or API specific error, raise a RetryableException with suggested wait seconds.
+
+Incremental fetch: store `last_fetched` per source in database; after successful fetch, update it with the newest post’s publish_time (or current time if none).
+
+9. THEME CLASSIFICATION ENGINE
+------------------------------
+Define a configuration file `config/themes.yml`:
+
+themes:
+  chemistry:
+    keywords: [химия, chemical, reaction, molecule, periodic table]
+  music:
+    keywords: [music, song, album, concert, музыка, трек]
+  rap:
+    keywords: [rap, hip-hop, рэп, бит, freestyle]
+  history:
+    keywords: [history, historical, война, ancient, medieval, история]
+  news:
+    keywords: [news, breaking, latest, новости, срочно]
+  programming:
+    keywords: [code, programming, python, java, javascript, developer, программирование]
+  vlog:
+    keywords: [vlog, daily, day in the life, блог, обзор дня]
+  games:
+    keywords: [game, gaming, playthrough, let's play, игровой]
+  diy:
+    keywords: [diy, craft, handmade, tutorial, сделать, своими руками]
+  technica:
+    keywords: [tech, gadget, device, technology, техника, гаджет]
+  travel:
+    keywords: [travel, trip, journey, vacation, tourism, путешествие]
+
+Classification function:
+  Input: post text + title + source (with possible theme_override)
+  Output: list of theme names (0..N)
+Steps:
+  - If source.theme_override is set, return [that theme] only (manual override).
+  - Lowercase combined text (title + " " + text).
+  - For each theme, if any keyword (lowercase) appears in combined text, add theme.
+  - Also consider hashtags: extract from text, remove #, match against theme names or keywords.
+
+Make classifier a module with reloadable config.
+
+10. SCHEDULING & UPDATE FREQUENCY
+---------------------------------
+Use APScheduler with AsyncIOScheduler.
+
+Define intervals per theme (or per source based on theme). Simpler: define per theme mapping:
+
+fetch_intervals = {
+    'news': 3600, 'programming': 3600,
+    'music': 10800, 'rap': 10800, 'vlog': 10800,
+    'chemistry': 21600, 'history': 21600, 'games': 21600,
+    'diy': 21600, 'technica': 21600, 'travel': 21600
+}
+
+Scheduler job:
+  - Every minute, query database for sources where now() - last_fetched >= interval_of_source_theme (if source has theme_override use that theme’s interval else for each source we need to know its primary theme? Actually a source may produce multiple themes. We can assign a default “category” to each source when adding it. For simplicity: each source has a `update_interval_minutes` column. Initially set according to its dominant theme.
+  - For each due source, asynchronously call its adapter’s fetch, then classify, store, notify.
+Use exponential backoff: if fetch fails, postpone next attempt by 5 * (2^attempt) seconds, max 1 hour.
+
+Implementation: use a queue with priority (due time). Or just iterate over due sources; if one raises RetryableException, reschedule it with new due time.
+
+11. DATABASE INTERACTION & OPTIMIZATION
+----------------------------------------
+Use SQLAlchemy 2.0 async (with asyncpg).
+Define models using `Mapped` annotations.
+Insert posts: use `INSERT ... ON CONFLICT DO NOTHING` (unique constraint) to avoid duplicates.
+Batch inserts: collect posts in list and use `add_all()` or `executemany`.
+
+For notifications: after inserting posts, query `user_subscriptions` join users to get tg_ids for each source_id. Use `RETURNING` from insert to get newly inserted post ids.
+
+Indexes already defined.
+
+12. ERROR HANDLING & LOGGING
+----------------------------
+Structured logging (JSON) – use `python-json-logger`. Log to file `logs/app.log` rotate weekly.
+Critical errors (unhandled exceptions) send to Sentry if DSN provided.
+
+Rate limit handling:
+  - For VK: catch error code 6 (too many requests), sleep 1 second and retry up to 3 times.
+  - For YouTube: check `quotaExceeded` – increase delay, stop fetching that day.
+  - For Telegram: Telethon has built‑in flood wait.
+
+Implement a decorator `@retry(max_attempts=3, backoff_base=2)` for fetch methods.
+
+13. SECURITY & PRIVACY CONSIDERATIONS
+--------------------------------------
+- All API keys, tokens, database credentials stored as environment variables, never hardcoded.
+- Use a `.env` file locally, loaded with `python-dotenv`.
+- User data: only store `tg_id` – no names, phone numbers.
+- Sanitize incoming content: before sending to user, escape MarkdownV2 special characters (for Telegram API). Remove any `<script>` tags or javascript: URLs from text. Use `bleach` library.
+
+14. DEPLOYMENT & DEVOPS PLAN
+----------------------------
+Containerization: Dockerfile based on python:3.10-slim.
+
+docker-compose.yml:
+  services:
+    db: postgres:13
+    bot: build . ; depends on db; env_file; volumes for logs.
+
+Environment variables:
+  BOT_TOKEN=...
+  VK_API_KEY=...
+  YT_API_KEY=...
+  DATABASE_URL=postgresql+asyncpg://user:pass@db/dbname
+  TELEGRAM_API_ID=...
+  TELEGRAM_API_HASH=...
+  SENTRY_DSN=optional
+
+CI/CD: GitHub Actions workflow:
+  - on push to main: run pytest, then build docker, push to registry, ssh to VPS, docker-compose pull && up -d.
+
+Hosting: VPS with 2GB RAM, 1 vCPU (e.g., DigitalOcean or Hetzner).
+
+15. TESTING & ROLLOUT STRATEGY
+------------------------------
+Unit tests (pytest):
+  - test_classifier: given text, expected themes.
+  - test_deduplication: insert same post twice – no duplicate in DB.
+  - Mock adapters: test fetch returns correct RawPost structure.
+
+Integration test (using test database):
+  - Add a dummy source with known posts, run scheduler cycle, verify posts stored and bot message sent (mock bot).
+
+Phased rollout:
+  1. Run bot in private group with 5 test users.
+  2. Add 5 real sources per theme.
+  3. Monitor logs for errors, adjust intervals.
+  4. Open to public, gradually increase user limit.
+
+Monitoring:
+  - Log metrics: total commands, subscriptions per theme, fetch success/failure count.
+  - Optionally expose Prometheus endpoint (/metrics) with python client.
+
+IMPLEMENTATION STEPS FOR AI AGENT
+----------------------------------
+Follow this exact order:
+
+1. Initialize project:
+   mkdir aggregator_bot && cd aggregator_bot
+   python -m venv venv
+   source venv/bin/activate
+   pip install python-telegram-bot telethon aiohttp sqlalchemy asyncpg apscheduler pyyaml python-dotenv bleach sentry-sdk pytest pytest-asyncio
+
+2. Create file structure:
+   aggregator_bot/
+   ├── bot/
+   │   ├── __init__.py
+   │   ├── main.py       # bot entry point
+   │   ├── handlers.py   # command handlers
+   │   └── keyboards.py
+   ├── fetchers/
+   │   ├── __init__.py
+   │   ├── base.py
+   │   ├── telegram_adapter.py
+   │   ├── vk_adapter.py
+   │   └── youtube_adapter.py
+   ├── classifier/
+   │   ├── __init__.py
+   │   └── engine.py
+   ├── db/
+   │   ├── __init__.py
+   │   ├── models.py
+   │   └── crud.py
+   ├── scheduler/
+   │   ├── __init__.py
+   │   └── jobs.py
+   ├── config/
+   │   └── themes.yml
+   ├── logs/
+   ├── .env
+   ├── docker-compose.yml
+   ├── Dockerfile
+   └── requirements.txt
+
+3. Write code for each module according to specifications above. Use asyncio everywhere; both bot and scheduler run in same event loop.
+
+4. Configure logging: in main.py, set up rotating file handler with JSON formatter.
+
+5. Write tests in `tests/` directory.
+
+6. Build Docker image and test locally.
+
+7. Deploy to VPS.
+
+Now, produce the code for each file. The AI must generate complete, runnable code for every file listed above. Follow best practices: type hints, docstrings, error handling.
+
+--- End of Technical Instruction ---
+
+
+

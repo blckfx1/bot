@@ -1,0 +1,77 @@
+1. Project Overview & Objectives
+   - Purpose: aggregate news/content from Telegram, VKontakte, YouTube across 11 themes (chemistry, music, rap, history, news, programming, vlog, games, DIY, technica, travel).
+   - Target platform: Telegram bot (user-facing interface).
+   - Key goals: automated fetching, filtering by theme, periodic updates, user subscription management.
+
+2. Functional Requirements
+   - Bot commands: /start, /subscribe [theme], /unsubscribe, /list, /help.
+   - Multi-source ingestion: connectors for Telegram channels, VK public pages/groups, YouTube channels/playlists.
+   - Theme classification: rule-based (keywords, hashtags, channel categories) or ML-light.
+
+3. Non-Functional Requirements
+   - Performance: <2s response for user queries, periodic updates within 15 min delay.
+   - Scalability: support up to 10k users, 50 sources per theme.
+   - Reliability: error handling for API rate limits, retry logic.
+
+4. Data Sources & API Specifications
+   - Telegram: MTProto or Bot API (for public channels), scraping fallback.
+   - VKontakte: VK API (groups/wall.get, public pages).
+   - YouTube: YouTube Data API v3 (search, channel videos).
+   - Rate limits, authentication (API keys, tokens).
+
+5. Data Model & Storage Schema
+   - Entities: User, Source (channel/group/account), Post (raw content), Theme, Subscription.
+   - Storage: PostgreSQL (users, subscriptions, posts metadata) + optional Redis for caching.
+   - Tables: users(id, tg_id, created_at), themes(id, name), sources(...), posts(...), user_subscriptions(...).
+
+6. System Architecture Diagram (Text Description)
+   - Components: Telegram Bot (async handler), Fetcher Scheduler (cron), Classifier, Database, API Gateway layer.
+   - Data flow: Scheduler → pull from sources → classify → store → notify subscribed users via bot.
+
+7. Bot Interface & Command Design
+   - Command handlers with inline keyboards for theme selection.
+   - Subscription flow: user chooses theme → bot shows available sources → confirm.
+   - Push notifications: new posts matching user's subscriptions sent as formatted messages with media.
+
+8. Content Fetching Module
+   - Modular adapters: TelegramAdapter, VKAdapter, YouTubeAdapter.
+   - Unified post schema: source_id, external_id, title, text, media_urls, publish_time, theme(s).
+   - Incremental fetch: store last fetched timestamp per source.
+
+9. Theme Classification Engine
+   - Keyword mapping per theme (multilingual support: en/ru if needed).
+   - Post text + title + channel metadata → assign 0..n themes.
+   - Configuration file for keyword lists, easy to update.
+   - Optional: manual override for specific sources.
+
+10. Scheduling & Update Frequency
+    - Asyncio + APScheduler (or Celery beat).
+    - Intervals: news/programming – every 1h; music/rap/vlog – 3h; others – 6h.
+    - Retry with exponential backoff on API failures.
+
+11. Database Interaction & Optimization
+    - Avoid duplicates: composite unique key (source_id, external_id).
+    - Indexes: theme, publish_time, user_subscriptions.
+    - Batch inserts for fetched posts.
+
+12. Error Handling & Logging
+    - Logging: structured (JSON) to file + optional Sentry for critical errors.
+    - Rate limit handling: respect API headers, delay retry.
+    - Fallback: if source fails, skip until next cycle.
+
+13. Security & Privacy Considerations
+    - Store API keys/tokens as environment variables.
+    - No storage of user personal data beyond Telegram ID.
+    - Sanitize incoming content (remove malicious links/scripts).
+
+14. Deployment & DevOps Plan
+    - Containerization: Docker + docker-compose.
+    - Hosting: small VPS (e.g., 2GB RAM, 1vCPU) or PaaS (Railway/Heroku).
+    - Environment variables: BOT_TOKEN, VK_API_KEY, YT_API_KEY, DB_URL.
+    - CI/CD: GitHub Actions for linting, tests, deploy to VPS via SSH.
+
+15. Testing & Rollout Strategy
+    - Unit tests: classification, deduplication, adapters (mocked APIs).
+    - Integration test: end-to-end fetch → store → notify with dummy sources.
+    - Phased rollout: internal group test → 100 users → full.
+    - Monitoring: bot metrics (commands, subscriptions, fetch success rate).

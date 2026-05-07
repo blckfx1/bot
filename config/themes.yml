@@ -1,0 +1,23 @@
+themes:
+  chemistry:
+    keywords: [химия, chemical, reaction, molecule, periodic table]
+  music:
+    keywords: [music, song, album, concert, музыка, трек]
+  rap:
+    keywords: [rap, hip-hop, рэп, бит, freestyle]
+  history:
+    keywords: [history, historical, война, ancient, medieval, история]
+  news:
+    keywords: [news, breaking, latest, новости, срочно]
+  programming:
+    keywords: [code, programming, python, java, javascript, developer, программирование]
+  vlog:
+    keywords: [vlog, daily, day in the life, блог, обзор дня]
+  games:
+    keywords: [game, gaming, playthrough, let's play, игровой]
+  diy:
+    keywords: [diy, craft, handmade, tutorial, сделать, своими руками]
+  technica:
+    keywords: [tech, gadget, device, technology, техника, гаджет]
+  travel:
+    keywords: [travel, trip, journey, vacation, tourism, путешествие]
